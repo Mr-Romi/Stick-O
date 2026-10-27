@@ -1,6 +1,6 @@
 # 🥷 Shadow Stickman: Eclipse Duel — Game Guide
 
-<!-- Uploading "shadow_stickman_gameplay.mp4"... -->
+[<!-- Uploading "shadow_stickman_gameplay.mp4"... -->](https://github.com/user-attachments/assets/615cf0a5-7799-438c-b686-22be0237c1bf)
 
 > A 30-FPS terminal martial arts fighting game. No external dependencies.
 > ```
