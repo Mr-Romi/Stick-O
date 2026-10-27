@@ -1,5 +1,7 @@
 # 🥷 Shadow Stickman: Eclipse Duel — Game Guide
 
+<!-- Uploading "shadow_stickman_gameplay.mp4"... -->
+
 > A 30-FPS terminal martial arts fighting game. No external dependencies.
 > ```
 > python shadow_stickman.py                  # Title screen, then play vs AI
