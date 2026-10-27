@@ -12,6 +12,7 @@ Quick Run:
   python shadow_stickman.py          # Interactive terminal game (Windows/Linux/macOS)
   python shadow_stickman.py --demo   # Automated AI vs AI demonstration match
   python shadow_stickman.py --test   # Run built-in self-diagnostic test suite
+  python shadow_stickman.py --demo --seed=7   # Reproducible AI vs AI match (any integer seed)
 
 Controls:
   A / D or Left / Right : Move / Dash (press E to Dash)
@@ -67,6 +68,15 @@ STAGE_WIDTH = 100
 STAGE_HEIGHT = 26
 GROUND_Y = 20
 GRAVITY = 0.55
+SHADOW_FORM_DAMAGE_MULT = 1.40  # Applies to melee AND projectiles while Shadow Form is active
+
+# Terminals report key presses / OS auto-repeats, not key-up events, so a held key can show
+# gaps of a frame or two. Held-type keys (move/crouch/guard) stay "latched" for this many
+# frames after their last event so guard and crouch do not flicker (and re-open the parry window).
+HOLD_GRACE_FRAMES = 3
+LEFT_KEYS = {ord("a"), ord("A"), KEY_LEFT}
+RIGHT_KEYS = {ord("d"), ord("D"), KEY_RIGHT}
+HOLD_KEYS = LEFT_KEYS | RIGHT_KEYS | {ord("s"), ord("S"), KEY_DOWN}
 
 # States
 STATE_IDLE = "IDLE"
@@ -102,6 +112,7 @@ class MoveSpec:
     hitstun: int          # Frames of hitstun
     is_low: bool = False  # Sweeps/lows hit standing guard; require crouch block
     is_overhead: bool = False  # Overheads hit crouching guard; require standing block
+    is_high: bool = False  # High attacks whiff completely against a crouching defender
     causes_knockdown: bool = False
     shadow_cost: float = 0.0
     forward_momentum: float = 0.0
@@ -141,13 +152,13 @@ MOVES: Dict[str, MoveSpec] = {
     "high_kick": MoveSpec(
         name="Snap High Kick", startup=4, active=3, recovery=5,
         damage=12.0, shadow_gain=14.0, reach_x=10, reach_y_top=-6, reach_y_bot=-2,
-        knockback_x=2.4, knockback_y=-0.6, hitstun=8, forward_momentum=0.8,
+        knockback_x=2.4, knockback_y=-0.6, hitstun=8, is_high=True, forward_momentum=0.8,
         pose_startup="windup_kick", pose_active="high_kick", pose_recovery="idle"
     ),
     "roundhouse": MoveSpec(
         name="Spinning Roundhouse", startup=6, active=3, recovery=7,
         damage=18.0, shadow_gain=20.0, reach_x=12, reach_y_top=-6, reach_y_bot=-2,
-        knockback_x=4.0, knockback_y=-1.5, hitstun=12, causes_knockdown=True,
+        knockback_x=4.0, knockback_y=-1.5, hitstun=12, is_high=True, causes_knockdown=True,
         forward_momentum=1.8,
         pose_startup="spin", pose_active="roundhouse", pose_recovery="idle"
     ),
@@ -504,6 +515,26 @@ class Projectile:
     active: bool = True
 
 
+@dataclass
+class HitPlan:
+    """A fully evaluated contact (melee or projectile), decided BEFORE any state is mutated."""
+    attacker: "Fighter"
+    defender: "Fighter"
+    kind: str                 # "parry", "block" or "hit"
+    damage: float
+    shadow_gain: float
+    knockback_x: float
+    knockback_y: float
+    hitstun: int
+    causes_knockdown: bool
+    push_dir: int
+    hit_x: float
+    hit_y: float
+    is_counter: bool = False
+    is_projectile: bool = False
+    shadowy: bool = False     # Shadow abilities get shadow-colored sparks
+
+
 # ---------------------------------------------------------------------------
 # Fighter Class
 # ---------------------------------------------------------------------------
@@ -655,7 +686,8 @@ class Fighter:
     def is_invulnerable(self) -> bool:
         if self.state == STATE_KNOCKDOWN and self.state_timer > 3:
             return True
-        if self.state == STATE_DASH and self.state_timer >= 3:
+        # state_timer is decremented before hit checks, so >= 2 gives exactly 3 invulnerable frames
+        if self.state == STATE_DASH and self.state_timer >= 2:
             return True
         if (
             self.state == STATE_ATTACK
@@ -717,8 +749,12 @@ class ShadowFightEngine:
         self.announcer_timer = 45
         self.paused = False
 
-        random.seed(42)
-        self.stars = [(random.randint(2, STAGE_WIDTH - 3), random.randint(1, 9)) for _ in range(28)]
+        # Private RNG for the fixed starfield so the global RNG (AI, particles) is never reseeded
+        star_rng = random.Random(42)
+        self.stars = [(star_rng.randint(2, STAGE_WIDTH - 3), star_rng.randint(1, 9)) for _ in range(28)]
+
+        self.buffered_keys: Set[int] = set()   # Presses made during hitstop, replayed afterwards
+        self.hold_age: Dict[int, int] = {}     # Frames since each held-type key was last seen
 
     def start_next_round(self) -> None:
         self.round_num += 1
@@ -732,12 +768,17 @@ class ShadowFightEngine:
         self.round_over_timer = 0
         self.announcer_text = f"ROUND {self.round_num} - FIGHT!"
         self.announcer_timer = 45
+        self.hitstop_frames = 0
+        self.screen_shake = 0
+        self.buffered_keys = set()
+        self.hold_age = {}
 
     def reset_match(self, p1_is_ai: bool = False) -> None:
         self.p1 = Fighter(1, "SHADOW RONIN", 28.0, +1, is_ai=p1_is_ai, weapon=WEAPON_KATANA)
         self.p2 = Fighter(2, "ECLIPSE SHOGUN", 72.0, -1, is_ai=True, weapon=WEAPON_KUSARI)
         self.round_num = 0
         self.match_winner = None
+        self.paused = False
         self.start_next_round()
 
     def spawn_hit_sparks(self, x: float, y: float, count: int, color_pair: int, heavy: bool = False) -> None:
@@ -1008,7 +1049,7 @@ class ShadowFightEngine:
             ai.blocking = False
             ai.block_frames = 0
             if opponent.blocking and opponent.state == STATE_CROUCH:
-                choice = random.choice(["katana_heavy", "roundhouse", "cross"])
+                choice = random.choice(["katana_heavy", "jab", "cross"])  # roundhouse is high: whiffs on crouch
             elif opponent.blocking:
                 choice = random.choice(["sweep", "uppercut", "jab"])
             else:
@@ -1099,7 +1140,7 @@ class ShadowFightEngine:
                         x=f.x + f.facing * 3.0,
                         y=f.y - 3.5,
                         vx=f.facing * 2.8,
-                        damage=m.damage * (1.35 if f.shadow_form else 1.0),
+                        damage=m.damage * (SHADOW_FORM_DAMAGE_MULT if f.shadow_form else 1.0),
                         shadow_gain=m.shadow_gain,
                     )
                 )
@@ -1133,111 +1174,201 @@ class ShadowFightEngine:
     def boxes_overlap(b1: Tuple[float, float, float, float], b2: Tuple[float, float, float, float]) -> bool:
         return not (b1[2] < b2[0] or b1[0] > b2[2] or b1[3] < b2[1] or b1[1] > b2[3])
 
-    def check_melee_hit(self, attacker: Fighter, defender: Fighter) -> None:
-        if self.round_over or attacker.state != STATE_ATTACK or attacker.current_move is None or attacker.move_has_hit:
-            return
-        hitbox = attacker.get_active_hitbox()
-        if hitbox is None or defender.is_invulnerable():
-            return
-        hurtbox = defender.get_hurtbox()
-        if not self.boxes_overlap(hitbox, hurtbox):
-            return
+    def _latch_held_keys(self, keys: Set[int]) -> Set[int]:
+        """Keep held-type keys (move/crouch/guard) alive across short terminal key-repeat gaps."""
+        out = set(keys)
+        pressed_left = bool(keys & LEFT_KEYS)
+        pressed_right = bool(keys & RIGHT_KEYS)
+        for k in list(self.hold_age):
+            if k in keys:
+                continue
+            # A fresh press of the opposite direction must win immediately
+            if (pressed_right and k in LEFT_KEYS) or (pressed_left and k in RIGHT_KEYS):
+                del self.hold_age[k]
+                continue
+            self.hold_age[k] += 1
+            if self.hold_age[k] <= HOLD_GRACE_FRAMES:
+                out.add(k)
+            else:
+                del self.hold_age[k]
+        for k in keys:
+            if k in HOLD_KEYS:
+                self.hold_age[k] = 0
+        return out
 
-        # Hit registered!
-        attacker.move_has_hit = True
-        move = attacker.current_move
-        hit_x = (max(hitbox[0], hurtbox[0]) + min(hitbox[2], hurtbox[2])) * 0.5
-        hit_y = (max(hitbox[1], hurtbox[1]) + min(hitbox[3], hurtbox[3])) * 0.5
+    def _set_hitstop(self, frames: int) -> None:
+        self.hitstop_frames = max(self.hitstop_frames, frames)
 
-        # Evaluate guard & parry rules
+    def _set_shake(self, frames: int) -> None:
+        self.screen_shake = max(self.screen_shake, frames)
+
+    def _plan_hit(
+        self,
+        attacker: Fighter,
+        defender: Fighter,
+        *,
+        damage: float,
+        shadow_gain: float,
+        knockback_x: float,
+        knockback_y: float,
+        hitstun: int,
+        causes_knockdown: bool,
+        is_low: bool,
+        is_overhead: bool,
+        push_dir: int,
+        hit_x: float,
+        hit_y: float,
+        is_projectile: bool = False,
+        shadowy: bool = False,
+    ) -> HitPlan:
+        """Decide parry / block / hit from the defender's CURRENT state, without changing anything."""
         guard_valid = defender.blocking
         if guard_valid:
-            if move.is_low and defender.state != STATE_CROUCH:
+            if is_low and defender.state != STATE_CROUCH:
                 guard_valid = False
-            elif move.is_overhead and defender.state == STATE_CROUCH:
+            elif is_overhead and defender.state == STATE_CROUCH:
                 guard_valid = False
 
-        # Just-frame Parry if defender started blocking within last 3 frames
         if guard_valid and 1 <= defender.block_frames <= 3:
-            defender.shadow = min(defender.max_shadow, defender.shadow + 15.0)
-            attacker.state = STATE_HITSTUN
-            attacker.state_timer = 8
-            attacker.current_move = None
-            attacker.vx = -attacker.facing * 2.0
-            self.hitstop_frames = 3
-            self.spawn_hit_sparks(hit_x, hit_y, 12, 4, heavy=True)
-            self.add_floating_text(defender.x, defender.y - 7, "PARRY! +15 SHADOW", 4)
-            return
+            kind = "parry"  # Just-frame parry: guard started within the last 3 frames
+        elif guard_valid:
+            kind = "block"
+        else:
+            kind = "hit"
 
-        if guard_valid:
-            chip_dmg = max(1.0, move.damage * 0.18)
-            defender.hp = max(0.0, defender.hp - chip_dmg)
-            defender.vx = attacker.facing * move.knockback_x * 0.45
-            attacker.shadow = min(attacker.max_shadow, attacker.shadow + move.shadow_gain * 0.35)
-            defender.shadow = min(defender.max_shadow, defender.shadow + move.shadow_gain * 0.25)
-            self.spawn_hit_sparks(hit_x, hit_y, 6, 4, heavy=False)
-            self.add_floating_text(defender.x, defender.y - 7, "BLOCKED", 4)
-            self.hitstop_frames = 1
-            return
-
-        # Unblocked hit! Check for Counter Hit (if defender was in attack startup)
         is_counter = (
-            defender.state == STATE_ATTACK
+            kind == "hit"
+            and defender.state == STATE_ATTACK
             and defender.current_move is not None
             and defender.move_frame < defender.current_move.startup
         )
+        return HitPlan(
+            attacker=attacker, defender=defender, kind=kind, damage=damage, shadow_gain=shadow_gain,
+            knockback_x=knockback_x, knockback_y=knockback_y, hitstun=hitstun,
+            causes_knockdown=causes_knockdown, push_dir=push_dir, hit_x=hit_x, hit_y=hit_y,
+            is_counter=is_counter, is_projectile=is_projectile, shadowy=shadowy,
+        )
 
-        # Combo scaling so infinite/long combos stay balanced
-        defender.combo_count += 1
-        defender.combo_timer = 32
-        combo_scale = max(0.45, 1.0 - 0.10 * (defender.combo_count - 1))
-        shadow_mult = 1.40 if attacker.shadow_form else 1.0
-        counter_mult = 1.25 if is_counter else 1.0
+    def _plan_melee(self, attacker: Fighter, defender: Fighter) -> Optional[HitPlan]:
+        if self.round_over or attacker.state != STATE_ATTACK or attacker.current_move is None or attacker.move_has_hit:
+            return None
+        hitbox = attacker.get_active_hitbox()
+        if hitbox is None or defender.is_invulnerable():
+            return None
+        move = attacker.current_move
+        if move.is_high and defender.state == STATE_CROUCH:
+            return None  # High attacks sail over a crouching defender
+        hurtbox = defender.get_hurtbox()
+        if not self.boxes_overlap(hitbox, hurtbox):
+            return None
+        hit_x = (max(hitbox[0], hurtbox[0]) + min(hitbox[2], hurtbox[2])) * 0.5
+        hit_y = (max(hitbox[1], hurtbox[1]) + min(hitbox[3], hurtbox[3])) * 0.5
+        return self._plan_hit(
+            attacker, defender,
+            damage=move.damage, shadow_gain=move.shadow_gain,
+            knockback_x=move.knockback_x, knockback_y=move.knockback_y, hitstun=move.hitstun,
+            causes_knockdown=move.causes_knockdown, is_low=move.is_low, is_overhead=move.is_overhead,
+            push_dir=attacker.facing, hit_x=hit_x, hit_y=hit_y, shadowy=move.shadow_cost > 0,
+        )
 
-        final_dmg = move.damage * combo_scale * shadow_mult * counter_mult
-        defender.hp = max(0.0, defender.hp - final_dmg)
+    def _apply_hit(self, plan: HitPlan) -> None:
+        a, d = plan.attacker, plan.defender
+        if not plan.is_projectile:
+            a.move_has_hit = True
 
-        # Shadow form lifesteal or shadow energy gain
-        if attacker.shadow_form:
-            attacker.hp = min(attacker.max_hp, attacker.hp + final_dmg * 0.25)
+        if plan.kind == "parry":
+            d.shadow = min(d.max_shadow, d.shadow + 15.0)
+            if not plan.is_projectile:  # A parried projectile is simply destroyed
+                a.state = STATE_HITSTUN
+                a.state_timer = 8
+                a.current_move = None
+                a.vx = -a.facing * 2.0
+            self._set_hitstop(3)
+            self.spawn_hit_sparks(plan.hit_x, plan.hit_y, 12, 4, heavy=True)
+            self.add_floating_text(d.x, d.y - 7, "PARRY! +15 SHADOW", 4)
+            return
+
+        if plan.kind == "block":
+            chip_dmg = max(1.0, plan.damage * 0.18)
+            d.hp = max(0.0, d.hp - chip_dmg)
+            d.vx = plan.push_dir * plan.knockback_x * 0.45
+            if a.shadow_form:  # Same rule as an unblocked hit: lifesteal instead of shadow gain
+                a.hp = min(a.max_hp, a.hp + chip_dmg * 0.25)
+            else:
+                a.shadow = min(a.max_shadow, a.shadow + plan.shadow_gain * 0.35)
+            d.shadow = min(d.max_shadow, d.shadow + plan.shadow_gain * 0.25)
+            self.spawn_hit_sparks(plan.hit_x, plan.hit_y, 6, 4, heavy=False)
+            self.add_floating_text(d.x, d.y - 7, "DEFLECTED" if plan.is_projectile else "BLOCKED", 4)
+            self._set_hitstop(1)
+            return
+
+        # Unblocked hit
+        d.combo_count += 1
+        d.combo_timer = 32
+        combo_scale = max(0.45, 1.0 - 0.10 * (d.combo_count - 1))
+        # Projectile damage already carries the Shadow Form multiplier from when it was spawned
+        shadow_mult = SHADOW_FORM_DAMAGE_MULT if (a.shadow_form and not plan.is_projectile) else 1.0
+        counter_mult = 1.25 if plan.is_counter else 1.0
+
+        final_dmg = plan.damage * combo_scale * shadow_mult * counter_mult
+        d.hp = max(0.0, d.hp - final_dmg)
+
+        if a.shadow_form:
+            a.hp = min(a.max_hp, a.hp + final_dmg * 0.25)
         else:
-            attacker.shadow = min(attacker.max_shadow, attacker.shadow + move.shadow_gain)
-        defender.shadow = min(defender.max_shadow, defender.shadow + move.shadow_gain * 0.55)
+            a.shadow = min(a.max_shadow, a.shadow + plan.shadow_gain)
+        d.shadow = min(d.max_shadow, d.shadow + plan.shadow_gain * 0.55)
 
-        # Apply knockback & hitstun / knockdown
-        defender.current_move = None
-        defender.blocking = False
-        defender.block_frames = 0
-        defender.vx = attacker.facing * move.knockback_x
-        if move.knockback_y < 0:
-            defender.vy = move.knockback_y
+        d.current_move = None
+        d.blocking = False
+        d.block_frames = 0
+        d.vx = plan.push_dir * plan.knockback_x
+        if plan.knockback_y < 0:
+            d.vy = plan.knockback_y
 
-        if move.causes_knockdown or defender.hp <= 0:
-            defender.state = STATE_KNOCKDOWN if defender.hp > 0 else STATE_DEFEAT
-            defender.state_timer = 18
-            self.screen_shake = 4
-            self.hitstop_frames = 3
+        if plan.causes_knockdown or d.hp <= 0:
+            d.state = STATE_KNOCKDOWN if d.hp > 0 else STATE_DEFEAT
+            d.state_timer = 18
+            self._set_shake(4)
+            self._set_hitstop(3)
         else:
-            defender.state = STATE_HITSTUN
-            defender.state_timer = move.hitstun + (3 if is_counter else 0)
-            self.screen_shake = 2 if final_dmg >= 14 else 0
-            self.hitstop_frames = 2 if final_dmg >= 14 else 1
+            d.state = STATE_HITSTUN
+            d.state_timer = plan.hitstun + (3 if plan.is_counter else 0)
+            if final_dmg >= 14:
+                self._set_shake(2)
+                self._set_hitstop(2)
+            else:
+                self._set_hitstop(1)
 
-        spark_color = 5 if (move.shadow_cost > 0 or attacker.shadow_form) else 3
-        self.spawn_hit_sparks(hit_x, hit_y, 14 if final_dmg >= 14 else 8, spark_color, heavy=(final_dmg >= 14))
+        spark_color = 5 if (plan.shadowy or a.shadow_form) else 3
+        self.spawn_hit_sparks(plan.hit_x, plan.hit_y, 14 if final_dmg >= 14 else 8, spark_color, heavy=(final_dmg >= 14))
 
-        label = f"-{int(round(final_dmg))}"
-        if is_counter:
+        label = f"KUNAI -{int(round(final_dmg))}" if plan.is_projectile else f"-{int(round(final_dmg))}"
+        if plan.is_counter:
             label = f"COUNTER! {label}"
-        elif defender.combo_count >= 2:
-            label = f"{defender.combo_count}x HIT! {label}"
-        self.add_floating_text(defender.x, defender.y - 7, label, spark_color)
+        elif d.combo_count >= 2:
+            label = f"{d.combo_count}x HIT! {label}"
+        self.add_floating_text(d.x, d.y - 7, label, spark_color)
+
+    def check_melee_hits(self) -> None:
+        """Resolve both fighters' melee contacts from the SAME snapshot so neither has priority."""
+        plans = [self._plan_melee(self.p1, self.p2), self._plan_melee(self.p2, self.p1)]
+        for plan in plans:
+            if plan is not None:
+                self._apply_hit(plan)
+
+    def check_melee_hit(self, attacker: Fighter, defender: Fighter) -> None:
+        """Single-direction resolve (kept for API compatibility)."""
+        plan = self._plan_melee(attacker, defender)
+        if plan is not None:
+            self._apply_hit(plan)
 
     def update_projectiles(self) -> None:
         if self.round_over:
             self.projectiles.clear()
             return
 
+        spec = MOVES["kunai_throw"]
         for proj in self.projectiles:
             if not proj.active:
                 continue
@@ -1250,30 +1381,20 @@ class ShadowFightEngine:
             target = self.p2 if proj.owner_id == 1 else self.p1
             attacker = self.p1 if proj.owner_id == 1 else self.p2
             if target.is_invulnerable():
-                continue
+                continue  # Same rule as melee: invulnerable targets are passed through
 
             hurtbox = target.get_hurtbox()
             pbox = (proj.x - 1.5, proj.y - 0.5, proj.x + 1.5, proj.y + 0.5)
             if self.boxes_overlap(pbox, hurtbox):
                 proj.active = False
-                if target.blocking:
-                    target.hp = max(0.0, target.hp - 1.5)
-                    self.spawn_hit_sparks(proj.x, proj.y, 5, 4)
-                    self.add_floating_text(target.x, target.y - 7, "DEFLECTED", 4)
-                else:
-                    target.hp = max(0.0, target.hp - proj.damage)
-                    if attacker.shadow_form:
-                        attacker.hp = min(attacker.max_hp, attacker.hp + proj.damage * 0.25)
-                    else:
-                        attacker.shadow = min(attacker.max_shadow, attacker.shadow + proj.shadow_gain)
-                    target.current_move = None
-                    target.blocking = False
-                    target.block_frames = 0
-                    target.state = STATE_HITSTUN if target.hp > 0 else STATE_DEFEAT
-                    target.state_timer = 7
-                    target.vx = (1.5 if proj.vx > 0 else -1.5)
-                    self.spawn_hit_sparks(proj.x, proj.y, 9, 3, heavy=True)
-                    self.add_floating_text(target.x, target.y - 7, f"KUNAI -{int(proj.damage)}", 3)
+                plan = self._plan_hit(
+                    attacker, target,
+                    damage=proj.damage, shadow_gain=proj.shadow_gain,
+                    knockback_x=spec.knockback_x, knockback_y=spec.knockback_y, hitstun=spec.hitstun,
+                    causes_knockdown=False, is_low=False, is_overhead=False,
+                    push_dir=1 if proj.vx > 0 else -1, hit_x=proj.x, hit_y=proj.y, is_projectile=True,
+                )
+                self._apply_hit(plan)
 
         self.projectiles = [p for p in self.projectiles if p.active]
 
@@ -1341,8 +1462,13 @@ class ShadowFightEngine:
         # Hitstop freeze frames for impactful heavy hits
         if self.hitstop_frames > 0:
             self.hitstop_frames -= 1
+            self.buffered_keys |= keys  # Do not lose presses made while frozen
             self.update_fx()
             return
+
+        if self.buffered_keys:
+            keys = keys | self.buffered_keys
+            self.buffered_keys = set()
 
         if not self.round_over:
             self.round_timer = max(0, self.round_timer - 1)
@@ -1350,7 +1476,7 @@ class ShadowFightEngine:
         if self.p1.is_ai:
             self.process_ai(self.p1, self.p2)
         else:
-            self.process_player_input(self.p1, self.p2, keys)
+            self.process_player_input(self.p1, self.p2, self._latch_held_keys(keys))
 
         if self.p2.is_ai:
             self.process_ai(self.p2, self.p1)
@@ -1359,8 +1485,7 @@ class ShadowFightEngine:
         self.update_fighter_physics(self.p2, self.p1)
         self.resolve_pushbox()
 
-        self.check_melee_hit(self.p1, self.p2)
-        self.check_melee_hit(self.p2, self.p1)
+        self.check_melee_hits()
         self.update_projectiles()
         self.update_fx()
         self.check_round_end()
@@ -1904,6 +2029,7 @@ def run_curses_app(stdscr: "_curses_mod._CursesWindow", demo_mode: bool = False,
 # ---------------------------------------------------------------------------
 def run_self_tests() -> int:
     print("Running Shadow Stickman Self-Diagnostic Test Suite...")
+    random.seed(2024)  # Deterministic AI/particles for the test run
 
     # 1. Verify all poses have consistent 6-line height and clean mirroring
     for pose_name in POSE_ART_RIGHT:
@@ -2001,6 +2127,101 @@ def run_self_tests() -> int:
     assert eng.p2.current_move is None, "Projectile hit should reset defender current_move"
     assert eng.p2.blocking is False and eng.p2.block_frames == 0, "Projectile hit should reset guard state"
 
+    # 7. Constructing an engine must not reseed the global RNG
+    random.seed(123)
+    expected_roll = random.random()
+    random.seed(123)
+    ShadowFightEngine()
+    assert random.random() == expected_roll, "Engine construction must not touch the global RNG"
+    random.seed(2024)
+
+    # 8. Simultaneous hits are a true trade (no player-1 priority)
+    eng = ShadowFightEngine()
+    eng.p2.is_ai = False
+    eng.p1.x, eng.p2.x = 45.0, 51.0
+    eng.p1.start_move("cross")
+    eng.p2.start_move("cross")
+    for _ in range(14):
+        eng.step(set())
+    assert eng.p1.hp == eng.p2.hp < 100.0, f"Trade should hurt both equally (p1={eng.p1.hp}, p2={eng.p2.hp})"
+
+    # 9. Presses made during hitstop are replayed afterwards
+    eng = ShadowFightEngine()
+    eng.p2.is_ai = False
+    eng.hitstop_frames = 2
+    eng.step({ord("j")})
+    eng.step(set())
+    eng.step(set())
+    assert eng.p1.state == STATE_ATTACK, "Jab pressed during hitstop should execute once it ends"
+
+    # 10. Crouching evades high attacks but not mid attacks
+    for key, should_hit in (("high_kick", False), ("roundhouse", False), ("jab", True)):
+        eng = ShadowFightEngine()
+        eng.p2.is_ai = False
+        eng.p1.x, eng.p2.x = 45.0, 50.0
+        eng.p2.state = STATE_CROUCH
+        eng.p1.start_move(key)
+        for _ in range(16):
+            eng.step(set())
+        assert (eng.p2.hp < 100.0) == should_hit, f"{key} vs crouching defender: expected hit={should_hit}"
+
+    # 11. Projectiles follow the same rules as melee (combo count, hitstop, parry)
+    eng = ShadowFightEngine()
+    eng.p2.is_ai = False
+    eng.projectiles.append(Projectile(owner_id=1, x=eng.p2.x - 1, y=eng.p2.y - 3.5, vx=2.8, damage=8.0, shadow_gain=10.0))
+    eng.update_projectiles()
+    assert eng.p2.combo_count == 1 and eng.hitstop_frames >= 1, "Kunai hit should count as a combo hit and cause hitstop"
+    eng = ShadowFightEngine()
+    eng.p2.is_ai = False
+    eng.p2.blocking = True
+    eng.p2.block_frames = 2
+    hp_before = eng.p2.hp
+    eng.projectiles.append(Projectile(owner_id=1, x=eng.p2.x - 1, y=eng.p2.y - 3.5, vx=2.8, damage=8.0, shadow_gain=10.0))
+    eng.update_projectiles()
+    assert eng.p2.hp == hp_before and not eng.projectiles, "Just-frame parry should destroy a kunai without damage"
+    assert eng.p1.state != STATE_HITSTUN, "Parrying a kunai must not stun the thrower"
+
+    # 12. Shadow Form: guarded hits lifesteal like normal hits
+    eng = ShadowFightEngine()
+    eng.p2.is_ai = False
+    eng.p1.shadow_form = True
+    eng.p1.shadow = 60.0
+    eng.p1.hp = 50.0
+    eng.p1.x, eng.p2.x = 45.0, 50.0
+    eng.p1.start_move("cross")
+    for _ in range(12):
+        eng.p2.blocking = True
+        eng.p2.block_frames = 10
+        eng.step(set())
+    assert eng.p1.hp > 50.0, "Shadow Form lifesteal should also apply to guarded hits"
+
+    # 13. Dash gives exactly 3 invulnerable frames
+    eng = ShadowFightEngine()
+    eng.p2.is_ai = False
+    assert eng.p1.start_dash(+1)
+    invulnerable_frames = 0
+    for _ in range(8):
+        eng.step(set())
+        invulnerable_frames += 1 if eng.p1.is_invulnerable() else 0
+    assert invulnerable_frames == 3, f"Dash should be invulnerable for 3 frames (got {invulnerable_frames})"
+
+    # 14. A held guard survives a one-frame key-repeat gap, and direction changes are instant
+    eng = ShadowFightEngine()
+    eng.p2.is_ai = False
+    for _ in range(10):
+        eng.step({ord("s")})
+    eng.step(set())
+    eng.step({ord("s")})
+    assert eng.p1.block_frames == 12, f"Guard should not flicker (block_frames={eng.p1.block_frames})"
+    for _ in range(HOLD_GRACE_FRAMES + 1):
+        eng.step(set())
+    assert eng.p1.state == STATE_IDLE and eng.p1.block_frames == 0, "Guard should release after the grace window"
+    eng = ShadowFightEngine()
+    eng.p2.is_ai = False
+    eng.step({ord("a")})
+    eng.step({ord("d")})
+    assert eng.p1.vx > 0, "Pressing the opposite direction must override a latched key immediately"
+
     print("All self-diagnostic checks passed with zero errors!")
     return 0
 
@@ -2014,6 +2235,8 @@ def main() -> int:
     for arg in sys.argv[1:]:
         if arg.startswith("--frames="):
             max_frames = int(arg.split("=", 1)[1])
+        if arg.startswith("--seed="):
+            random.seed(int(arg.split("=", 1)[1]))
     try:
         if HAS_CURSES and not force_ansi and os.name != "nt":
             _curses_mod.wrapper(run_curses_app, demo_mode=demo_mode, max_demo_frames=max_frames)
